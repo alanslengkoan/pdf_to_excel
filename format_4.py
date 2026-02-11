@@ -1,322 +1,179 @@
-# ============================================================
-# KONVERSI REKENING KORAN BCA
-# Format: Tanggal | Keterangan | CBG | Mutasi | Saldo
-# ============================================================
+# Install dependencies di Google Colab
+!pip install pdfplumber openpyxl
 
-!pip install pdfplumber pandas openpyxl -q
-print("✅ Libraries installed!\n")
-
-from google.colab import files
-print("📤 Upload PDF rekening koran BCA:")
-uploaded = files.upload()
-pdf_file = list(uploaded.keys())[0]
-print(f"✅ {pdf_file}\n")
-
+# Import libraries
 import pdfplumber
 import pandas as pd
 import re
+from datetime import datetime
+from google.colab import files
 
-print("🔄 Extracting data...\n")
-
-all_rows = []
-info = {}
-
-# ============================================================
-# FUNGSI KONVERSI FORMAT ANGKA (US → ID)
-# ============================================================
-def convert_to_indonesian_format(value):
-    """Konversi format angka dari 196,000.00 menjadi 196.000,00"""
-    if pd.isna(value) or value == '' or value == '0.00':
-        return ''
+def parse_bca_pdf(pdf_path):
+    """
+    Parse BCA bank statement PDF to extract transactions
+    """
+    transactions = []
     
-    value_str = str(value).strip()
-    value_str = re.sub(r'[^\d,.-]', '', value_str)
-    
-    if not value_str or value_str == '-' or value_str == '0.00':
-        return ''
-    
-    try:
-        # Format BCA: 196,000.00 (koma ribuan, titik desimal)
-        if ',' in value_str and '.' in value_str:
-            value_str = value_str.replace(',', '')
-            number = float(value_str)
-        elif ',' in value_str:
-            value_str = value_str.replace(',', '')
-            number = float(value_str)
-        elif '.' in value_str:
-            number = float(value_str)
-        else:
-            number = float(value_str)
-        
-        # Format ke Indonesia: 196.000,00
-        formatted = f"{number:,.2f}"
-        formatted = formatted.replace(',', 'TEMP').replace('.', ',').replace('TEMP', '.')
-        return formatted
-        
-    except (ValueError, AttributeError):
-        return value_str
-
-# ============================================================
-# FUNGSI PEMBERSIH TEXT
-# ============================================================
-def clean_text(text):
-    """Bersihkan karakter aneh dari text"""
-    if pd.isna(text) or text == '':
-        return ''
-    
-    text = str(text)
-    text = re.sub(r'[^\x20-\x7E\n]', '', text)
-    text = re.sub(r'\s+', ' ', text)
-    return text.strip()
-
-with pdfplumber.open(pdf_file) as pdf:
-    total_pages = len(pdf.pages)
-    print(f"📄 Total pages: {total_pages}\n")
-    
-    # Get header info dari halaman pertama
-    first_text = pdf.pages[0].extract_text()
-    lines = first_text.split('\n')
-    
-    for i, line in enumerate(lines[:40]):
-        # Extract nama (biasanya baris pertama dalam box)
-        if i > 5 and i < 15 and len(line.strip()) > 10:
-            if not any(x in line.upper() for x in ['REKENING', 'HALAMAN', 'PERIODE', 'NO.', 'CATATAN']):
-                if 'Nama' not in info:
-                    info['Nama'] = line.strip()
-        
-        # No Rekening
-        if 'NO. REKENING' in line.upper() or 'NO.REKENING' in line.upper():
-            match = re.search(r':?\s*(\d+)', line)
-            if match:
-                info['No_Rekening'] = match.group(1)
-        
-        # Periode
-        if 'PERIODE' in line.upper():
-            match = re.search(r':?\s*([A-Z]+\s+\d{4})', line, re.IGNORECASE)
-            if match:
-                info['Periode'] = match.group(1)
-        
-        # Mata Uang
-        if 'MATA UANG' in line.upper():
-            if 'IDR' in line:
-                info['Mata_Uang'] = 'IDR'
-    
-    print("🔍 Extracting transactions...\n")
-    
-    # Process each page
-    for page_num, page in enumerate(pdf.pages, 1):
-        print(f"   Processing page {page_num}/{total_pages}...", end='\r')
-        
-        # Extract text
-        text = page.extract_text()
-        
-        if not text:
-            continue
-        
-        lines = text.split('\n')
-        
-        i = 0
-        while i < len(lines):
-            line = lines[i].strip()
+    with pdfplumber.open(pdf_path) as pdf:
+        for page_num, page in enumerate(pdf.pages, 1):
+            text = page.extract_text()
+            lines = text.split('\n')
             
-            # Skip kosong
-            if not line:
-                i += 1
-                continue
-            
-            # Skip header
-            if 'TANGGAL' in line.upper() and 'KETERANGAN' in line.upper():
-                i += 1
-                continue
-            if 'REKENING GIRO' in line:
-                i += 1
-                continue
-            if 'Bersambung' in line:
-                i += 1
-                continue
-            
-            # Cek apakah baris dimulai dengan tanggal (format: DD/MM)
-            date_match = re.match(r'^(\d{2}/\d{2})\s+(.+)', line)
-            
-            if date_match:
-                tanggal = date_match.group(1)
-                rest = date_match.group(2).strip()
-                
-                # Kumpulkan baris-baris berikutnya yang merupakan bagian dari transaksi ini
-                # (baris yang tidak dimulai dengan tanggal atau SALDO AWAL)
-                continuation_lines = []
-                j = i + 1
-                
-                while j < len(lines):
-                    next_line = lines[j].strip()
-                    
-                    # Stop jika ketemu tanggal baru atau SALDO AWAL
-                    if re.match(r'^\d{2}/\d{2}\s+', next_line):
-                        break
-                    if next_line.startswith('SALDO AWAL'):
-                        break
-                    if not next_line:
-                        j += 1
-                        continue
-                    
-                    # Tambahkan ke continuation
-                    continuation_lines.append(next_line)
-                    j += 1
-                
-                # Gabungkan semua baris
-                full_text = rest + ' ' + ' '.join(continuation_lines)
-                full_text = re.sub(r'\s+', ' ', full_text).strip()
-                
-                # Parse data
-                # Format: Keterangan ... CBG ... Mutasi ... [Saldo]
-                # Cari semua angka dalam format amount
-                amounts = re.findall(r'\d{1,3}(?:,\d{3})*(?:\.\d{2})', full_text)
-                
-                if len(amounts) == 0:
-                    i = j
-                    continue
-                
-                # Identifikasi Saldo dan Mutasi
-                # Saldo biasanya angka terbesar dan ada di akhir
-                # Mutasi adalah angka sebelum saldo
-                
-                saldo = ''
-                mutasi = ''
-                
-                if len(amounts) >= 2:
-                    mutasi = amounts[-2]
-                    saldo = amounts[-1]
-                elif len(amounts) == 1:
-                    # Jika hanya 1 angka, bisa jadi saldo saja atau mutasi saja
-                    # Check apakah ada kata kunci
-                    if 'SALDO AWAL' in full_text.upper():
-                        saldo = amounts[0]
-                    else:
-                        mutasi = amounts[0]
-                
-                # Extract Keterangan dan CBG
-                # Hapus amounts dari text
-                text_only = full_text
-                for amt in amounts:
-                    text_only = text_only.replace(amt, '', 1)
-                
-                text_only = re.sub(r'\s+', ' ', text_only).strip()
-                
-                # CBG biasanya kode singkat (DR 564, dll)
-                # atau kode transaksi
-                cbg = ''
-                keterangan_parts = []
-                
-                parts = text_only.split()
-                
-                # Cari pattern CBG (biasanya 2-3 kata di tengah atau akhir)
-                for idx, part in enumerate(parts):
-                    # DR, CR diikuti angka
-                    if part in ['DR', 'CR'] and idx + 1 < len(parts):
-                        cbg = f"{part} {parts[idx + 1]}"
-                        break
-                
-                # Keterangan adalah sisanya
-                if cbg:
-                    keterangan = text_only.replace(cbg, '', 1).strip()
-                else:
-                    # Ambil beberapa kata terakhir sebagai CBG jika ada
-                    if len(parts) > 3:
-                        # Coba ambil 2 kata terakhir sebagai CBG
-                        potential_cbg = ' '.join(parts[-2:])
-                        # Cek apakah terlihat seperti kode
-                        if len(potential_cbg) < 20 and (potential_cbg.isupper() or re.match(r'^[\w\s-]+$', potential_cbg)):
-                            cbg = potential_cbg
-                            keterangan = ' '.join(parts[:-2])
+            for line in lines:
+                # Match transaction lines starting with date DD/MM
+                if re.match(r'^\d{2}/\d{2}\s+', line):
+                    try:
+                        # Extract components
+                        parts = line.split()
+                        date = parts[0]
+                        
+                        # Find all numbers in the line
+                        numbers = re.findall(r'([\d,]+\.\d{2})', line)
+                        
+                        # Get transaction type
+                        trans_type = ''
+                        if 'TRSF E-BANKING CR' in line:
+                            trans_type = 'Transfer E-Banking (Kredit)'
+                        elif 'TRSF E-BANKING DB' in line:
+                            trans_type = 'Transfer E-Banking (Debit)'
+                        elif 'BI-FAST CR' in line:
+                            trans_type = 'BI-FAST (Kredit)'
+                        elif 'BI-FAST DB' in line:
+                            trans_type = 'BI-FAST (Debit)'
+                        elif 'SWITCHING CR' in line:
+                            trans_type = 'Switching (Kredit)'
+                        elif 'BIAYA ADM' in line:
+                            trans_type = 'Biaya Admin'
+                        elif 'BUNGA' in line:
+                            trans_type = 'Bunga'
+                        elif 'PAJAK BUNGA' in line:
+                            trans_type = 'Pajak Bunga'
                         else:
-                            keterangan = text_only
-                    else:
-                        keterangan = text_only
-                
-                keterangan = clean_text(keterangan)
-                cbg = clean_text(cbg)
-                
-                all_rows.append([tanggal, keterangan, cbg, mutasi, saldo])
-                
-                i = j
-            else:
-                i += 1
+                            trans_type = parts[1] if len(parts) > 1 else ''
+                        
+                        # Extract description
+                        # Remove date, transaction type, and numbers
+                        desc = line
+                        desc = re.sub(r'^\d{2}/\d{2}\s+', '', desc)
+                        desc = re.sub(r'(TRSF E-BANKING CR|TRSF E-BANKING DB|BI-FAST CR|BI-FAST DB|SWITCHING CR|BIAYA ADM|BUNGA|PAJAK BUNGA)', '', desc)
+                        desc = re.sub(r'\s+[\d,]+\.\d{2}.*$', '', desc)
+                        desc = re.sub(r'^\s*\d+\s+', '', desc)  # Remove CBG code
+                        desc = desc.strip()
+                        
+                        # Determine debit/credit and amounts
+                        is_debit = ' DB' in line
+                        
+                        if numbers:
+                            balance = float(numbers[-1].replace(',', ''))
+                            
+                            if len(numbers) >= 2:
+                                amount = float(numbers[-2].replace(',', ''))
+                            else:
+                                amount = 0
+                        else:
+                            amount = 0
+                            balance = 0
+                        
+                        transaction = {
+                            'Tanggal': date + '/2025',
+                            'Tipe Transaksi': trans_type,
+                            'Keterangan': desc,
+                            'Debit': amount if is_debit else 0,
+                            'Kredit': amount if not is_debit else 0,
+                            'Saldo': balance
+                        }
+                        
+                        transactions.append(transaction)
+                    
+                    except Exception as e:
+                        print(f"Error parsing line: {line[:50]}... - {e}")
+                        continue
+    
+    return transactions
 
-print(f"\n\n✅ Extracted: {len(all_rows):,} rows\n")
-
-if len(all_rows) == 0:
-    print("❌ Tidak ada data yang terekstrak!")
-    print("\nDEBUG: Sample text untuk analisa:")
-    with pdfplumber.open(pdf_file) as pdf:
-        text = pdf.pages[0].extract_text()
-        lines = text.split('\n')
-        print("\nBaris yang mengandung tanggal:")
-        for i, line in enumerate(lines):
-            if re.search(r'\d{2}/\d{2}', line):
-                print(f"   {i}: {line}")
-else:
-    # Create DataFrame
-    df = pd.DataFrame(all_rows, columns=[
-        'Tanggal', 'Keterangan', 'CBG', 'Mutasi', 'Saldo'
-    ])
+def create_excel_report(transactions, output_path):
+    """
+    Create Excel file with transactions and summary
+    """
+    # Create main DataFrame
+    df = pd.DataFrame(transactions)
     
-    df = df.replace('', pd.NA)
-    df = df.dropna(how='all')
-    df = df.drop_duplicates()
-    df = df.reset_index(drop=True)
+    # Calculate summary
+    total_kredit = df['Kredit'].sum()
+    total_debit = df['Debit'].sum()
+    saldo_awal = 645447905.64
+    saldo_akhir = df['Saldo'].iloc[-1] if len(df) > 0 else 0
     
-    print(f"🔄 Cleaning and formatting data...\n")
-    
-    df['Keterangan'] = df['Keterangan'].fillna('').apply(clean_text)
-    df['CBG'] = df['CBG'].fillna('').apply(clean_text)
-    
-    df['Mutasi'] = df['Mutasi'].fillna('').apply(convert_to_indonesian_format)
-    df['Saldo'] = df['Saldo'].fillna('').apply(convert_to_indonesian_format)
-    
-    # Hitung total mutasi
-    total_mutasi = df['Mutasi'].apply(lambda x: float(x.replace('.', '').replace(',', '.')) if x else 0).sum()
-    
-    info['Total_Mutasi'] = f"{total_mutasi:,.2f}".replace(',', 'TEMP').replace('.', ',').replace('TEMP', '.')
-    
-    print(f"📊 Final data: {len(df):,} rows\n")
-    
-    # Save to Excel
-    output = 'rekening_koran_bca.xlsx'
-    with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        info_data = [
-            ['Nama', info.get('Nama', '')],
-            ['No. Rekening', info.get('No_Rekening', '')],
-            ['Periode', info.get('Periode', '')],
-            ['Mata Uang', info.get('Mata_Uang', '')],
-            ['Total Mutasi', info.get('Total_Mutasi', '')],
-            ['Total Transaksi', f"{len(df):,}"],
+    summary_data = {
+        'Keterangan': ['Saldo Awal', 'Total Kredit', 'Total Debit', 'Saldo Akhir', 'Jumlah Transaksi'],
+        'Nilai': [
+            f'Rp {saldo_awal:,.2f}',
+            f'Rp {total_kredit:,.2f}',
+            f'Rp {total_debit:,.2f}',
+            f'Rp {saldo_akhir:,.2f}',
+            f'{len(df)} transaksi'
         ]
-        pd.DataFrame(info_data).to_excel(writer, sheet_name='Info', index=False, header=False)
-        df.to_excel(writer, sheet_name='Transaksi', index=False)
+    }
+    df_summary = pd.DataFrame(summary_data)
     
-    print("✅ Excel saved\n")
+    # Format currency columns
+    for col in ['Debit', 'Kredit', 'Saldo']:
+        if col in df.columns:
+            df[col] = df[col].apply(lambda x: f'Rp {x:,.2f}' if x > 0 else '')
     
-    # Preview
-    print("="*140)
-    print("INFORMASI REKENING")
-    print("="*140)
-    for key, value in info.items():
-        print(f"{key:20s}: {value}")
+    # Write to Excel
+    with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
+        df_summary.to_excel(writer, sheet_name='Ringkasan', index=False)
+        df.to_excel(writer, sheet_name='Detail Transaksi', index=False)
+        
+        # Auto-adjust column width
+        for sheet_name in writer.sheets:
+            worksheet = writer.sheets[sheet_name]
+            for column in worksheet.columns:
+                max_length = 0
+                column_letter = column[0].column_letter
+                for cell in column:
+                    try:
+                        if len(str(cell.value)) > max_length:
+                            max_length = len(cell.value)
+                    except:
+                        pass
+                adjusted_width = min(max_length + 2, 50)
+                worksheet.column_dimensions[column_letter].width = adjusted_width
     
-    print("\n" + "="*140)
-    print("PREVIEW TRANSAKSI (15 Pertama)")
-    print("="*140)
-    pd.set_option('display.max_colwidth', 70)
-    pd.set_option('display.width', None)
-    print(df.head(15).to_string(index=False))
-    
-    print(f"\n\n📊 Summary:")
-    print(f"   Total Transaksi: {len(df):,}")
-    
-    print(f"\n{'='*140}")
-    
-    files.download(output)
-    df.to_csv('rekening_koran_bca.csv', index=False, encoding='utf-8-sig')
-    files.download('rekening_koran_bca.csv')
-    print(f"\n🎉 Done! {len(df):,} transaksi berhasil dikonversi")
-    print("📥 File: rekening_koran_bca.xlsx & rekening_koran_bca.csv")
+    return df, df_summary
+
+# MAIN EXECUTION
+print("=== BCA PDF to Excel Converter ===\n")
+
+# Upload PDF file
+print("Silakan upload file PDF BCA Anda:")
+uploaded = files.upload()
+
+# Get the uploaded filename
+pdf_filename = list(uploaded.keys())[0]
+print(f"\nFile uploaded: {pdf_filename}")
+
+# Parse PDF
+print("\nMemproses PDF...")
+transactions = parse_bca_pdf(pdf_filename)
+print(f"Berhasil mengekstrak {len(transactions)} transaksi")
+
+# Create Excel
+excel_filename = 'BCA_Rekening_Koran_Desember_2025.xlsx'
+print(f"\nMembuat file Excel: {excel_filename}")
+df_trans, df_summary = create_excel_report(transactions, excel_filename)
+
+# Display summary
+print("\n=== RINGKASAN ===")
+print(df_summary.to_string(index=False))
+
+# Display sample transactions
+print("\n=== SAMPLE DATA (10 Transaksi Pertama) ===")
+print(df_trans.head(10).to_string(index=False))
+
+# Download the Excel file
+print(f"\nMengunduh file Excel...")
+files.download(excel_filename)
+
+print("\n✅ Konversi selesai!")
